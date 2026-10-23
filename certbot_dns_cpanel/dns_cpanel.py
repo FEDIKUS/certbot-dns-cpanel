@@ -1,17 +1,20 @@
 """cPanel dns-01 authenticator & installer plugin"""
 import logging
-import base64
 import json
 import re
 
 try:
     # python 3
-    from urllib.request import urlopen, Request
-    from urllib.parse import urlencode
+    from http.cookiejar import CookieJar
+    from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler
+    from urllib.parse import urlencode, urlsplit
+    from urllib.error import HTTPError
 except ImportError:
     # python 2
+    from cookielib import CookieJar # type: ignore
     from urllib import urlencode
-    from urllib2 import urlopen, Request # type: ignore
+    from urlparse import urlsplit # type: ignore
+    from urllib2 import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler, HTTPError # type: ignore
 
 import zope.interface
 
@@ -35,6 +38,7 @@ class CpanelConfigurator(dns_common.DNSAuthenticator, common.Installer):
     def __init__(self, *args, **kwargs):
         super(CpanelConfigurator, self).__init__(*args, **kwargs)
         self.credentials = None
+        self._cpanel_client = None
 
     @classmethod
     def add_parser_arguments(cls, add): # pylint: disable=arguments-differ
@@ -65,6 +69,7 @@ class CpanelConfigurator(dns_common.DNSAuthenticator, common.Installer):
             raise errors.PluginError('%s: password or token (preferred) are required' % credentials.confobj.filename)
 
     def _setup_credentials(self):
+        self._cpanel_client = None
         self.credentials = self._configure_credentials(
             'credentials',
             'The cPanel credentials INI file',
@@ -123,23 +128,32 @@ class CpanelConfigurator(dns_common.DNSAuthenticator, common.Installer):
         if not self.credentials:
             raise errors.Error('No auth data')
 
-        if self.credentials.conf('token'):
-            return _CPanelClient(self.credentials.conf('url'), self.credentials.conf('username'), None, self.credentials.conf('token'))
-        elif self.credentials.conf('password'):
-            return _CPanelClient(self.credentials.conf('url'), self.credentials.conf('username'), self.credentials.conf('password'), None)
+        if self._cpanel_client is None:
+            self._cpanel_client = _CPanelClient(
+                self.credentials.conf('url'),
+                self.credentials.conf('username'),
+                self.credentials.conf('password'),
+                self.credentials.conf('token'),
+            )
+        return self._cpanel_client
 
-        return _CPanelClient(
-            self.credentials.conf('url'),
-            self.credentials.conf('username'),
-            self.credentials.conf('password'),
-            self.credentials.conf('token'),
-        )
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A redirect must not forward an API token to another server.
+        return None
 
 
 class _CPanelClient:
     """Encapsulate communications with the cPanel API 2"""
     def __init__(self, url, username, password, token):
-        self.request_url = "%s/json-api/cpanel" % url
+        if urlsplit(url).scheme != 'https':
+            raise errors.PluginError('The cPanel URL must use HTTPS')
+        self._base_url = url.rstrip('/')
+        # Keep the session token out of the URL used in debug messages.
+        self.request_url = "%s/json-api/cpanel" % self._base_url
+        self._session_path = ''
+        self._opener = build_opener(HTTPCookieProcessor(CookieJar()), _NoRedirectHandler())
         self.data = {
             'cpanel_jsonapi_user': username,
             'cpanel_jsonapi_apiversion': '2',
@@ -150,10 +164,47 @@ class _CPanelClient:
                 'Authorization': 'cpanel %s:%s' % (username, token)
             }
         else:
-            self.headers = {
-                'Authorization': 'Basic %s' % base64.b64encode(
-                ("%s:%s" % (username, password)).encode()).decode('utf8')
-            }
+            self.headers = {}
+            self._login(username, password)
+
+    def _login(self, username, password):
+        request = Request(
+            self._base_url + '/login/?login_only=1',
+            data=urlencode({'user': username, 'pass': password}).encode('utf-8'),
+        )
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            raise errors.PluginError('cPanel login failed (HTTP %s)' % exc.code) from None
+        except ValueError:
+            raise errors.PluginError('cPanel login returned invalid JSON') from None
+        if not isinstance(result, dict) or result.get('status') != 1:
+            raise errors.PluginError('cPanel login failed; check credentials and login requirements such as 2FA')
+        session_path = result.get('security_token', '')
+        if not isinstance(session_path, str) or not re.match(r'^/cpsess[0-9]+\Z', session_path):
+            raise errors.PluginError('cPanel login did not return a valid session token')
+        self._session_path = session_path
+
+    def _request(self, data):
+        request = Request(
+            self._base_url + self._session_path + '/json-api/cpanel?' + urlencode(data),
+            headers=self.headers,
+        )
+        operation = '%s.%s' % (data['cpanel_jsonapi_module'], data['cpanel_jsonapi_func'])
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            raise errors.PluginError('cPanel %s failed (HTTP %s)' % (operation, exc.code)) from None
+        except ValueError:
+            raise errors.PluginError('cPanel %s returned invalid JSON' % operation) from None
+        if not isinstance(result, dict) or not isinstance(result.get('cpanelresult'), dict):
+            raise errors.PluginError('cPanel %s returned an unexpected response' % operation)
+        result = result['cpanelresult']
+        if result.get('error'):
+            raise errors.PluginError('cPanel %s failed: %s' % (operation, result['error']))
+        return result
 
     def add_txt_record(self, record_name, record_content, record_ttl=60):
         """Add a TXT record
@@ -172,13 +223,7 @@ class _CPanelClient:
         data['txtdata'] = record_content
         data['ttl'] = record_ttl
 
-        response = urlopen(
-            Request(
-                "%s?%s" % (self.request_url, urlencode(data)),
-                headers=self.headers,
-            )
-        )
-        response_data = json.load(response)['cpanelresult']
+        response_data = self._request(data)
         logger.debug("add_zone_record: url='%s', data='%s', response data='%s'" % (
             self.request_url, json.dumps(data, indent=4), json.dumps(response_data, indent=4) ) )
         if response_data['data'][0]['result']['status'] == 1:
@@ -206,13 +251,7 @@ class _CPanelClient:
         for record_line in record_lines:
             data['line'] = record_line
 
-            response = urlopen(
-                Request(
-                    "%s?%s" % (self.request_url, urlencode(data)),
-                    headers=self.headers
-                )
-            )
-            response_data = json.load(response)['cpanelresult']
+            response_data = self._request(data)
             logger.debug("del_zone_record: url='%s', data='%s', response data='%s'" % (
                 self.request_url, json.dumps(data, indent=4),
                 json.dumps(response_data, indent=4)))
@@ -243,13 +282,7 @@ class _CPanelClient:
         data['key'] = open(key_path).read()
         data['cabundle'] = open(chain_path).read()
 
-        response = urlopen(
-            Request(
-                "%s?%s" % (self.request_url, urlencode(data)),
-                headers=self.headers
-            )
-        )
-        response_data = json.load(response)['cpanelresult']
+        response_data = self._request(data)
 
         logger.debug("install_ssl: url='%s', data='%s', response data='%s'" % (
             self.request_url, json.dumps(data, indent=4),
@@ -272,13 +305,7 @@ class _CPanelClient:
         data['cpanel_jsonapi_module'] = 'ZoneEdit'
         data['cpanel_jsonapi_func'] = 'fetchzones'
 
-        response = urlopen(
-            Request(
-                "%s?%s" % (self.request_url, urlencode(data)),
-                headers=self.headers
-            )
-        )
-        response_data = json.load(response)['cpanelresult']
+        response_data = self._request(data)
         logger.debug("_get_zone_and_name: url='%s', data='%s', response data='%s'" % (
             self.request_url, json.dumps(data, indent=4),
             json.dumps(response_data, indent=4)))
@@ -315,13 +342,7 @@ class _CPanelClient:
         data['txtdata'] = record_content
         data['ttl'] = record_ttl
 
-        response = urlopen(
-            Request(
-                "%s?%s" % (self.request_url, urlencode(data)),
-                headers=self.headers
-            )
-        )
-        response_data = json.load(response)['cpanelresult']
+        response_data = self._request(data)
         logger.debug("_get_record_line: url='%s', data='%s', response data='%s'" % (
             self.request_url, json.dumps(data, indent=4),
             json.dumps(response_data, indent=4)))
